@@ -34,7 +34,7 @@ except:
 
 
 def main(save_to, seed, num_epochs, sync_freq, alpha):
-    mlp = MLP([Tanh(), Softmax()], [784, 100, 10],
+    mlp = MLP([Tanh(), Softmax()], [784, 500, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
     mlp.initialize()
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
     parser = ArgumentParser("An example of training an MLP on"
                             " the MNIST dataset.")
-    parser.add_argument("--num-epochs", type=int, default=2,
+    parser.add_argument("--num-epochs", type=int, default=100,
                         help="Number of training epochs to do.")
     parser.add_argument("--seed", type=int, default=1,
                         help="Random seed for data traversal")
