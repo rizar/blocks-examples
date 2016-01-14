@@ -26,7 +26,7 @@ from blocks.extensions.monitoring import (DataStreamMonitoring,
 from blocks.main_loop import MainLoop
 from blocks_extras.extensions.synchronization import (
     Synchronize, SynchronizeWorker)
-from platoon.param_sync import EASGD
+from platoon.param_sync import EASGD, ASGD
 
 try:
     from blocks.extras.extensions.plot import Plot
@@ -36,7 +36,7 @@ except:
 
 
 def main(save_to, num_epochs,
-         learning_rate, sync_freq, alpha):
+         learning_rate, sync_freq, rule, alpha):
     mlp = MLP([Tanh(), Softmax()], [784, 100, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
@@ -56,7 +56,7 @@ def main(save_to, num_epochs,
     mnist_test = MNIST(("test",))
 
     worker = None
-    if alpha != None:
+    if rule:
         worker = SynchronizeWorker(cport=1111, socket_timeout=2000)
 
     algorithm = GradientDescent(
@@ -64,8 +64,13 @@ def main(save_to, num_epochs,
         step_rule=Scale(learning_rate=learning_rate))
     extensions = [Timing()]
     if worker:
-        extensions += [Synchronize(worker, 'MNIST', EASGD(alpha),
-                                   every_n_batches=sync_freq)]
+        if rule == 'asgd':
+            sync_rule = ASGD()
+        elif rule == 'easgd':
+            sync_rule = EASGD()
+        extensions += [
+            Synchronize(worker, 'MNIST', sync_rule,
+                        every_n_batches=sync_freq)]
     extensions += [
         FinishAfter(after_n_epochs=num_epochs),
         TrainingDataMonitoring(
@@ -125,6 +130,8 @@ if __name__ == "__main__":
                         help="Learning rate for SGD")
     parser.add_argument("--sync-freq", type=int, default=10,
                         help="Synchronization frequency")
+    parser.add_argument("--rule", choices=[None, 'asgd', 'easgd'],
+                        help="Synchronization frequency")
     parser.add_argument("--alpha", type=float, default=None,
                         help="Alpha parameter for EASGD. If given"
                              " training process is synchronized with"
@@ -134,4 +141,4 @@ if __name__ == "__main__":
                               "process."))
     args = parser.parse_args()
     main(args.save_to, args.num_epochs,
-         args.learning_rate, args.sync_freq, args.alpha)
+         args.learning_rate, args.sync_freq, args.rule, args.alpha)
