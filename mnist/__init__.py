@@ -10,6 +10,7 @@ from blocks.algorithms import GradientDescent, Scale
 from blocks.bricks import MLP, Tanh, Softmax, WEIGHT
 from blocks.bricks.cost import CategoricalCrossEntropy, MisclassificationRate
 from blocks.initialization import IsotropicGaussian, Constant
+from blocks.log import TrainingLog
 from fuel.streams import DataStream
 from fuel.transformers import Flatten
 from fuel.datasets import MNIST
@@ -23,7 +24,8 @@ from blocks.extensions.saveload import Checkpoint
 from blocks.extensions.monitoring import (DataStreamMonitoring,
                                           TrainingDataMonitoring)
 from blocks.main_loop import MainLoop
-from blocks_extras.extensions.synchronization import Synchronize
+from blocks_extras.extensions.synchronization import (
+    Synchronize, SynchronizeWorker)
 from platoon.param_sync import EASGD
 
 try:
@@ -33,7 +35,8 @@ except:
     BLOCKS_EXTRAS_AVAILABLE = False
 
 
-def main(save_to, seed, num_epochs, sync_freq, alpha):
+def main(save_to, num_epochs,
+         learning_rate, sync_freq, alpha):
     mlp = MLP([Tanh(), Softmax()], [784, 100, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
@@ -52,31 +55,37 @@ def main(save_to, seed, num_epochs, sync_freq, alpha):
     mnist_train = MNIST(("train",))
     mnist_test = MNIST(("test",))
 
+    worker = None
+    if alpha != None:
+        worker = SynchronizeWorker(cport=1111, socket_timeout=2000)
+
     algorithm = GradientDescent(
         cost=cost, parameters=cg.parameters,
-        step_rule=Scale(learning_rate=0.1))
+        step_rule=Scale(learning_rate=learning_rate))
     extensions = [Timing()]
-    if alpha:
-        extensions += [Synchronize('MNIST', 1111, EASGD(alpha),
+    if worker:
+        extensions += [Synchronize(worker, 'MNIST', EASGD(alpha),
                                    every_n_batches=sync_freq)]
     extensions += [
         FinishAfter(after_n_epochs=num_epochs),
-        DataStreamMonitoring(
-            [cost, error_rate],
-        Flatten(
-            DataStream.default_stream(
-                mnist_test,
-                iteration_scheme=ShuffledScheme(
-                    mnist_test.num_examples, 500)),
-            which_sources=('features',)),
-            prefix="test"),
         TrainingDataMonitoring(
             [cost, error_rate,
-             aggregation.mean(algorithm.total_gradient_norm)],
+                aggregation.mean(algorithm.total_gradient_norm)],
             prefix="train",
-            after_epoch=True),
-        Checkpoint(save_to),
-        Printing()]
+            after_epoch=True)]
+    if not worker or worker.is_main_worker:
+        extensions += [
+            DataStreamMonitoring(
+                [cost, error_rate],
+                Flatten(
+                    DataStream.default_stream(
+                        mnist_test,
+                        iteration_scheme=ShuffledScheme(
+                            mnist_test.num_examples, 500)),
+                    which_sources=('features',)),
+                    prefix="test"),
+        Checkpoint(save_to)]
+    extensions += [Printing()]
 
     if BLOCKS_EXTRAS_AVAILABLE:
         extensions.append(Plot(
@@ -86,6 +95,10 @@ def main(save_to, seed, num_epochs, sync_freq, alpha):
                  'test_misclassificationrate_apply_error_rate'],
                 ['train_total_gradient_norm']]))
 
+    log = TrainingLog()
+    # This will show up in the output of the training process
+    if worker:
+        log.status['is_main_worker'] = worker.is_main_worker
     main_loop = MainLoop(
         algorithm,
         Flatten(
@@ -93,7 +106,8 @@ def main(save_to, seed, num_epochs, sync_freq, alpha):
                 mnist_train,
                 iteration_scheme=ShuffledScheme(
                     mnist_train.num_examples, 50,
-                    rng=numpy.random.RandomState(seed))),
+                    rng=numpy.random.RandomState(
+                        worker.seed if worker else 1))),
             which_sources=('features',)),
         model=Model(cost),
         extensions=extensions)
@@ -106,8 +120,8 @@ if __name__ == "__main__":
                             " the MNIST dataset.")
     parser.add_argument("--num-epochs", type=int, default=2,
                         help="Number of training epochs to do.")
-    parser.add_argument("--seed", type=int, default=1,
-                        help="Random seed for data traversal")
+    parser.add_argument("--learning-rate", type=float, default=0.1,
+                        help="Learning rate for SGD")
     parser.add_argument("--sync-freq", type=int, default=10,
                         help="Synchronization frequency")
     parser.add_argument("--alpha", type=float, default=None,
@@ -118,4 +132,5 @@ if __name__ == "__main__":
                         help=("Destination to save the state of the training "
                               "process."))
     args = parser.parse_args()
-    main(args.save_to, args.seed, args.num_epochs, args.sync_freq, args.alpha)
+    main(args.save_to, args.num_epochs,
+         args.learning_rate, args.sync_freq, args.alpha)
