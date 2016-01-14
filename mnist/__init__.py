@@ -70,7 +70,7 @@ def main(save_to, num_epochs,
             sync_rule = EASGD()
         extensions += [
             Synchronize(worker, 'MNIST', sync_rule,
-                        every_n_batches=sync_freq)]
+                        every_n_batches=sync_freq, before_epoch=True)]
     extensions += [
         FinishAfter(after_n_epochs=num_epochs),
         TrainingDataMonitoring(
@@ -89,7 +89,7 @@ def main(save_to, num_epochs,
                             mnist_test.num_examples, 500)),
                     which_sources=('features',)),
                     prefix="test"),
-        Checkpoint(save_to)]
+        Checkpoint(save_to, after_epoch=True)]
     extensions += [Printing()]
 
     if BLOCKS_EXTRAS_AVAILABLE:
