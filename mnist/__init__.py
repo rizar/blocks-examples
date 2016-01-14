@@ -110,6 +110,7 @@ def main(save_to, num_epochs,
                         worker.seed if worker else 1))),
             which_sources=('features',)),
         model=Model(cost),
+        log=log,
         extensions=extensions)
 
     main_loop.run()
