@@ -26,7 +26,7 @@ from blocks.extensions.monitoring import (DataStreamMonitoring,
 from blocks.main_loop import MainLoop
 from blocks_extras.extensions.synchronization import (
     Synchronize, SynchronizeWorker)
-from platoon.param_sync import EASGD, ASGD
+from platoon.param_sync import ASGD
 
 try:
     from blocks.extras.extensions.plot import Plot
@@ -36,7 +36,7 @@ except:
 
 
 def main(save_to, num_epochs,
-         learning_rate, sync_freq, rule, alpha):
+         learning_rate, sync_freq, rule, alpha, port):
     mlp = MLP([Tanh(), Softmax()], [784, 500, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
@@ -57,20 +57,21 @@ def main(save_to, num_epochs,
 
     worker = None
     if rule:
-        worker = SynchronizeWorker(cport=1111, socket_timeout=2000)
+        sync_rule = ASGD()
+        worker = SynchronizeWorker(
+            sync_rule, control_port=port, socket_timeout=2000)
 
     algorithm = GradientDescent(
         cost=cost, parameters=cg.parameters,
         step_rule=Scale(learning_rate=learning_rate))
     extensions = [Timing()]
     if worker:
-        if rule == 'asgd':
-            sync_rule = ASGD()
-        elif rule == 'easgd':
-            sync_rule = EASGD()
+        # It is important to synchronize parameters before every epoch
+        # in this example. That is because the validation that we perform
+        # in the end of each epoch is time-consuming, and parameters
+        # become outdated after it.
         extensions += [
-            Synchronize(worker, 'MNIST', sync_rule,
-                        every_n_batches=sync_freq, before_epoch=True)]
+            Synchronize(worker, every_n_batches=sync_freq, before_epoch=True)]
     extensions += [
         FinishAfter(after_n_epochs=num_epochs),
         TrainingDataMonitoring(
@@ -79,6 +80,8 @@ def main(save_to, num_epochs,
             prefix="train",
             after_epoch=True)]
     if not worker or worker.is_main_worker:
+        # We are saving time by only doing validation in one of the workers,
+        # the one that is called "main worker".
         extensions += [
             DataStreamMonitoring(
                 [cost, error_rate],
@@ -92,7 +95,8 @@ def main(save_to, num_epochs,
         Checkpoint(save_to, after_epoch=True)]
     extensions += [Printing()]
 
-    if BLOCKS_EXTRAS_AVAILABLE:
+    if BLOCKS_EXTRAS_AVAILABLE and (not worker or worker.is_main_worker):
+        # TODO: try that this works
         extensions.append(Plot(
             'MNIST example',
             channels=[
@@ -101,8 +105,8 @@ def main(save_to, num_epochs,
                 ['train_total_gradient_norm']]))
 
     log = TrainingLog()
-    # This will show up in the output of the training process
     if worker:
+        # This will show up in the output of the training process
         log.status['is_main_worker'] = worker.is_main_worker
     main_loop = MainLoop(
         algorithm,
@@ -120,25 +124,31 @@ def main(save_to, num_epochs,
 
     main_loop.run()
 
+_help = (
+"""An example of training an MLP on the MNIST dataset
+(optionally using ASGD).
+
+Run multiple instances of this executable to perform
+Asynchronous Stochastic Gradient Descent (ASGD). Make
+sure to specify --rule and --port.
+""")
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
-    parser = ArgumentParser("An example of training an MLP on"
-                            " the MNIST dataset.")
+    parser = ArgumentParser(_help)
     parser.add_argument("--num-epochs", type=int, default=100,
                         help="Number of training epochs to do.")
     parser.add_argument("--learning-rate", type=float, default=0.1,
                         help="Learning rate for SGD")
     parser.add_argument("--sync-freq", type=int, default=10,
                         help="Synchronization frequency")
-    parser.add_argument("--rule", choices=[None, 'asgd', 'easgd'],
-                        help="Synchronization frequency")
-    parser.add_argument("--alpha", type=float, default=None,
-                        help="Alpha parameter for EASGD. If given"
-                             " training process is synchronized with"
-                             " similar instances.")
+    parser.add_argument("--rule", choices=[None, 'asgd'],
+                        help="The rule for synchronizing the parameters")
+    parser.add_argument("--port", type=int,
+                        help="The port at which the controller can be found")
     parser.add_argument("save_to", default="mnist.pkl", nargs="?",
                         help=("Destination to save the state of the training "
                               "process."))
     args = parser.parse_args()
     main(args.save_to, args.num_epochs,
-         args.learning_rate, args.sync_freq, args.rule, args.alpha)
+         args.learning_rate, args.sync_freq, args.rule, args.alpha, args.port)
