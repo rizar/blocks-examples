@@ -22,6 +22,8 @@ from blocks.extensions.saveload import Checkpoint
 from blocks.extensions.monitoring import (DataStreamMonitoring,
                                           TrainingDataMonitoring)
 from blocks.main_loop import MainLoop
+from blocks.bricks.lookup import LookupTable
+from blocks.theano_expressions import l2_norm
 
 try:
     from blocks.extras.extensions.plot import Plot
@@ -31,20 +33,48 @@ except:
 
 
 def main(save_to, num_epochs):
-    mlp = MLP([Tanh(), Softmax()], [784, 100, 10],
-              weights_init=IsotropicGaussian(0.01),
-              biases_init=Constant(0))
-    mlp.initialize()
     x = tensor.matrix('features')
     y = tensor.lmatrix('targets')
-    probs = mlp.apply(tensor.flatten(x, outdim=2))
-    cost = CategoricalCrossEntropy().apply(y.flatten(), probs)
-    error_rate = MisclassificationRate().apply(y.flatten(), probs)
+    batch_size = x.shape[0]
+
+    mlp_student = MLP([Tanh(), Softmax()], [784, 100, 10],
+              weights_init=IsotropicGaussian(0.01),
+              biases_init=Constant(0), name='mlp_student')
+    mlp_student.initialize()
+    mlp_teacher = MLP([Tanh(), Softmax()], [784, 100, 10],
+              weights_init=IsotropicGaussian(0.01),
+              biases_init=Constant(0), name='mlp_teacher')
+    mlp_teacher.initialize()
+
+    lookup = LookupTable(10, 784, weights_init=IsotropicGaussian(0.01))
+    lookup.initialize()
+    x_teacher = x + lookup.apply(y.flatten())
+
+    # Teacher tries to perform well
+    probs_teacher = mlp_teacher.apply(tensor.flatten(x_teacher, outdim=2))
+    cost_teacher = CategoricalCrossEntropy().apply(y.flatten(), probs_teacher)
+    cost_teacher.name = 'cost_teacher'
+    error_rate_teacher = MisclassificationRate().apply(y.flatten(), probs_teacher)
+    error_rate_teacher.name = 'error_rate_teacher'
+
+    # Student tries to imitate teacher
+    probs_student = mlp_student.apply(tensor.flatten(x, outdim=2))
+    error_rate_student = MisclassificationRate().apply(y.flatten(), probs_student)
+    error_rate_student.name = 'error_rate_student'
+
+    hiddens_teacher = VariableFilter(bricks=[Tanh])(ComputationGraph(probs_teacher))
+    hiddens_student = VariableFilter(bricks=[Tanh])(ComputationGraph(probs_student))
+    discrepancy = l2_norm(
+        [h_student - h_teacher
+         for h_student, h_teacher in zip(hiddens_student, hiddens_teacher)])
+    discrepancy = discrepancy ** 2 / 100 / batch_size
+    discrepancy += tensor.nnet.categorical_crossentropy(probs_student, probs_teacher).mean()
+    discrepancy.name = 'discrepancy'
+
+    cost = cost_teacher + discrepancy
+    cost.name = 'cost'
 
     cg = ComputationGraph([cost])
-    W1, W2 = VariableFilter(roles=[WEIGHT])(cg.variables)
-    cost = cost + .00005 * (W1 ** 2).sum() + .00005 * (W2 ** 2).sum()
-    cost.name = 'final_cost'
 
     mnist_train = MNIST(("train",))
     mnist_test = MNIST(("test",))
@@ -55,7 +85,7 @@ def main(save_to, num_epochs):
     extensions = [Timing(),
                   FinishAfter(after_n_epochs=num_epochs),
                   DataStreamMonitoring(
-                      [cost, error_rate],
+                      [cost_teacher, cost, error_rate_teacher, error_rate_student],
                       Flatten(
                           DataStream.default_stream(
                               mnist_test,
@@ -64,12 +94,13 @@ def main(save_to, num_epochs):
                           which_sources=('features',)),
                       prefix="test"),
                   TrainingDataMonitoring(
-                      [cost, error_rate,
+                      [cost_teacher, cost, discrepancy, error_rate_teacher, error_rate_student,
                        aggregation.mean(algorithm.total_gradient_norm)],
                       prefix="train",
-                      after_epoch=True),
+                      after_epoch=True,
+                      every_n_batches=None),
                   Checkpoint(save_to),
-                  Printing()]
+                  Printing(every_n_batches=None)]
 
     if BLOCKS_EXTRAS_AVAILABLE:
         extensions.append(Plot(
