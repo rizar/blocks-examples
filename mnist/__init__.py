@@ -26,7 +26,7 @@ from blocks.bricks.lookup import LookupTable
 from blocks.theano_expressions import l2_norm
 
 try:
-    from blocks.extras.extensions.plot import Plot
+    from blocks_extras.extensions.plot import Plot
     BLOCKS_EXTRAS_AVAILABLE = True
 except:
     BLOCKS_EXTRAS_AVAILABLE = False
@@ -37,11 +37,13 @@ def main(save_to, num_epochs):
     y = tensor.lmatrix('targets')
     batch_size = x.shape[0]
 
-    mlp_student = MLP([Tanh(), Softmax()], [784, 100, 10],
+    activations = [Tanh(), Tanh(), Tanh(), Softmax()]
+    dims = [784, 100, 100, 100, 10]
+    mlp_student = MLP(activations, dims,
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0), name='mlp_student')
     mlp_student.initialize()
-    mlp_teacher = MLP([Tanh(), Softmax()], [784, 100, 10],
+    mlp_teacher = MLP(activations, dims,
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0), name='mlp_teacher')
     mlp_teacher.initialize()
@@ -64,14 +66,19 @@ def main(save_to, num_epochs):
 
     hiddens_teacher = VariableFilter(bricks=[Tanh])(ComputationGraph(probs_teacher))
     hiddens_student = VariableFilter(bricks=[Tanh])(ComputationGraph(probs_student))
-    discrepancy = l2_norm(
+    average_mse = l2_norm(
         [h_student - h_teacher
-         for h_student, h_teacher in zip(hiddens_student, hiddens_teacher)])
-    discrepancy = discrepancy ** 2 / 100 / batch_size
-    discrepancy += tensor.nnet.categorical_crossentropy(probs_student, probs_teacher).mean()
+         for h_student, h_teacher in zip(hiddens_student, hiddens_teacher)]) ** 2
+    average_mse /= batch_size
+    average_mse /= sum(h.shape[1] for h in hiddens_teacher)
+    average_mse.name = 'average_mse'
+    cross_entropy = tensor.nnet.categorical_crossentropy(probs_student, probs_teacher).mean()
+    cross_entropy.name = 'cross_entropy'
+
+    discrepancy = 5 * average_mse + cross_entropy
     discrepancy.name = 'discrepancy'
 
-    cost = cost_teacher + discrepancy
+    cost = 0.6 * cost_teacher + discrepancy
     cost.name = 'cost'
 
     cg = ComputationGraph([cost])
@@ -94,7 +101,8 @@ def main(save_to, num_epochs):
                           which_sources=('features',)),
                       prefix="test"),
                   TrainingDataMonitoring(
-                      [cost_teacher, cost, discrepancy, error_rate_teacher, error_rate_student,
+                      [cost_teacher, cost, average_mse, cross_entropy,
+                       error_rate_teacher, error_rate_student,
                        aggregation.mean(algorithm.total_gradient_norm)],
                       prefix="train",
                       after_epoch=True,
@@ -104,10 +112,10 @@ def main(save_to, num_epochs):
 
     if BLOCKS_EXTRAS_AVAILABLE:
         extensions.append(Plot(
-            'MNIST example',
+            save_to,
             channels=[
-                ['test_final_cost',
-                 'test_misclassificationrate_apply_error_rate'],
+                ['test_error_rate_student',
+                 'train_error_rate_student'],
                 ['train_total_gradient_norm']]))
 
     main_loop = MainLoop(
