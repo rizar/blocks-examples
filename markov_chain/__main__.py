@@ -1,7 +1,7 @@
 import argparse
 import logging
 
-from . import main
+from markov_chain import main
 
 if __name__ == "__main__":
     logging.basicConfig(
