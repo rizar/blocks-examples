@@ -7,7 +7,8 @@ from argparse import ArgumentParser
 from theano import tensor
 
 from blocks.algorithms import GradientDescent, Scale
-from blocks.bricks import MLP, Tanh, Softmax, WEIGHT
+from blocks.bricks import MLP, Tanh, Softmax
+from blocks.roles import WEIGHT
 from blocks.bricks.cost import CategoricalCrossEntropy, MisclassificationRate
 from blocks.initialization import IsotropicGaussian, Constant
 from blocks.log import TrainingLog
