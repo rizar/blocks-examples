@@ -37,7 +37,7 @@ except:
 
 
 def main(save_to, num_epochs,
-         learning_rate, sync_freq, rule, alpha, port):
+         learning_rate, sync_freq, rule, port):
     mlp = MLP([Tanh(), Softmax()], [784, 500, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
@@ -152,4 +152,4 @@ if __name__ == "__main__":
                               "process."))
     args = parser.parse_args()
     main(args.save_to, args.num_epochs,
-         args.learning_rate, args.sync_freq, args.rule, args.alpha, args.port)
+         args.learning_rate, args.sync_freq, args.rule, args.port)
