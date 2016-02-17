@@ -14,7 +14,7 @@ from blocks.bricks import Tanh
 from blocks.bricks.recurrent import SimpleRecurrent
 from blocks.bricks.lookup import LookupTable
 from blocks_extras.bricks.sequence_generator2 import (
-    SequenceGenerator, SoftmaxReadout, LookupFeedback)
+    SequenceGenerator, SoftmaxReadout, Feedback)
 from blocks.graph import ComputationGraph
 from fuel.streams import DataStream
 from fuel.schemes import ConstantScheme
@@ -52,10 +52,10 @@ def main(mode, save_path, steps, num_batches):
             recurrent,
             SoftmaxReadout(dim=num_states,
                            merged_states=recurrent.apply.states),
-            LookupFeedback(lookup=LookupTable(num_states),
-                           # The next line assumes, that "mask" is the last
-                           # in apply.sequences
-                           feedback_sequences=recurrent.apply.sequences[:-1]),
+            Feedback(embedding=LookupTable(num_states),
+                    # The next line assumes, that "mask" is the last
+                    # in apply.sequences
+                     feedback_sequences=recurrent.apply.sequences[:-1]),
             weights_init=IsotropicGaussian(0.01), biases_init=Constant(0),
             name="generator")
         generator.push_initialization_config()
