@@ -81,7 +81,7 @@ def main(mode, save_path, steps, num_batches):
         algorithm = GradientDescent(
             cost=cost,
             parameters=ComputationGraph(cost).parameters,
-            step_rule=Scale(0.1))
+            step_rule=Scale(0.01))
         main_loop = MainLoop(
             algorithm=algorithm,
             data_stream=DataStream(

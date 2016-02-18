@@ -17,8 +17,9 @@ from blocks.bricks.lookup import LookupTable
 from blocks.bricks.recurrent import SimpleRecurrent, Bidirectional
 from blocks.bricks.attention import SequenceContentAttention
 from blocks.bricks.parallel import Fork
-from blocks.bricks.sequence_generators import (
-    SequenceGenerator, Readout, SoftmaxEmitter, LookupFeedback)
+from blocks_extras.bricks.sequence_generator2 import (
+    SequenceGenerator, SoftmaxReadout, Feedback)
+from blocks_extras.bricks.attention2 import AttentionRecurrent
 from blocks.config import config
 from blocks.graph import ComputationGraph
 from fuel.transformers import Mapping, Batch, Padding, Filter
@@ -100,32 +101,33 @@ class WordReverser(Initializable):
         fork.input_dim = dimension
         fork.output_dims = [encoder.prototype.get_dim(name) for name in fork.input_names]
         lookup = LookupTable(alphabet_size, dimension)
-        transition = SimpleRecurrent(
+        recurrent = SimpleRecurrent(
             activation=Tanh(),
-            dim=dimension, name="transition")
+            dim=dimension, name="recurrent")
         attention = SequenceContentAttention(
-            state_names=transition.apply.states,
+            state_names=recurrent.apply.states,
             attended_dim=2 * dimension, match_dim=dimension, name="attention")
-        readout = Readout(
-            readout_dim=alphabet_size,
-            source_names=[transition.apply.states[0],
-                          attention.take_glimpses.outputs[0]],
-            emitter=SoftmaxEmitter(name="emitter"),
-            feedback_brick=LookupFeedback(alphabet_size, dimension),
+        recurrent_with_attention = AttentionRecurrent(recurrent, attention)
+        readout = SoftmaxReadout(
+            dim=alphabet_size,
+            merged_states=[recurrent.apply.states[0],
+                           attention.take_glimpses.outputs[0]],
             name="readout")
+        feedback = Feedback(recurrent.apply.sequences[:-1],
+                            embedding=LookupTable(alphabet_size))
         generator = SequenceGenerator(
-            readout=readout, transition=transition, attention=attention,
+            recurrent_with_attention, readout, feedback,
             name="generator")
 
-        self.lookup = lookup
         self.fork = fork
+        self.lookup = lookup
         self.encoder = encoder
         self.generator = generator
-        self.children = [lookup, fork, encoder, generator]
+        self.children = [fork, lookup, encoder, generator]
 
     @application
-    def cost(self, chars, chars_mask, targets, targets_mask):
-        return self.generator.cost_matrix(
+    def costs(self, chars, chars_mask, targets, targets_mask):
+        return self.generator.costs(
             targets, targets_mask,
             attended=self.encoder.apply(
                 **dict_union(
@@ -167,14 +169,16 @@ def main(mode, save_path, num_batches, data_path=None):
         reverser.biases_init = Constant(0.0)
         reverser.push_initialization_config()
         reverser.encoder.weights_init = Orthogonal()
-        reverser.generator.transition.weights_init = Orthogonal()
+        reverser.generator.recurrent.weights_init = Orthogonal()
 
         # Build the cost computation graph
         chars = tensor.lmatrix("features")
         chars_mask = tensor.matrix("features_mask")
         targets = tensor.lmatrix("targets")
         targets_mask = tensor.matrix("targets_mask")
-        batch_cost = reverser.cost(
+        # Smart averaging of the training cost makes us immune
+        # to batches of different size
+        batch_cost = reverser.costs(
             chars, chars_mask, targets, targets_mask).sum()
         batch_size = chars.shape[1].copy(name="batch_size")
         cost = aggregation.mean(batch_cost, batch_size)
@@ -203,11 +207,11 @@ def main(mode, save_path, num_batches, data_path=None):
         # Fetch variables useful for debugging
         generator = reverser.generator
         (energies,) = VariableFilter(
-            applications=[generator.readout.readout],
+            applications=[generator.readout._merge],
             name_regex="output")(cg.variables)
         (activations,) = VariableFilter(
-            applications=[generator.transition.apply],
-            name=generator.transition.apply.states[0])(cg.variables)
+            applications=[generator.recurrent.apply],
+            name=generator.recurrent.apply.states[0])(cg.variables)
         max_length = chars.shape[0].copy(name="max_length")
         cost_per_character = aggregation.mean(
             batch_cost, batch_size * max_length).copy(
