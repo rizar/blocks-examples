@@ -285,10 +285,10 @@ def main(mode, save_path, num_batches, data_path=None):
                     {chars: input_}, char2code['</S>'],
                     3 * input_.shape[0])
             else:
-                _1, outputs, _2, _3, costs = (
-                    model.get_theano_function()(input_))
-                outputs = list(outputs.T)
-                costs = list(costs.T)
+                samples, scores =  model.get_theano_function()(input_)[:2]
+                outputs = list(samples.T)
+                costs = list(-scores.T)
+                masks = samples.copy()
                 for i in range(len(outputs)):
                     outputs[i] = list(outputs[i])
                     try:
@@ -297,6 +297,14 @@ def main(mode, save_path, num_batches, data_path=None):
                         true_length = len(outputs[i])
                     outputs[i] = outputs[i][:true_length]
                     costs[i] = costs[i][:true_length].sum()
+                    masks[:, i] = 0.
+                    masks[:true_length, i] = 1.
+                # Sanity check
+                args = [input_, numpy.ones_like(input_).astype('float32'),
+                        samples, masks.astype('float32')]
+                args = [tensor.as_tensor_variable(arg) for arg in args]
+                costs2 = reverser.costs(*args).eval()
+                print(costs, costs2)
             return outputs, costs
 
         while True:
