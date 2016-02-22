@@ -114,7 +114,7 @@ class WordReverser(Initializable):
                            attention.take_glimpses.outputs[0]],
             name="readout")
         feedback = Feedback(recurrent.apply.sequences[:-1],
-                            embedding=LookupTable(alphabet_size))
+                            embedding=LookupTable(alphabet_size, dimension))
         generator = SequenceGenerator(
             recurrent_with_attention, readout, feedback,
             name="generator")
@@ -231,7 +231,7 @@ def main(mode, save_path, num_batches, data_path=None):
 
         # Construct the main loop and start training!
         average_monitoring = TrainingDataMonitoring(
-            observables, prefix="average", every_n_batches=10)
+            observables, prefix="average", every_n_batches=100)
         main_loop = MainLoop(
             model=model,
             data_stream=data_stream,
@@ -246,9 +246,9 @@ def main(mode, save_path, num_batches, data_path=None):
                 .add_condition(["after_batch"], _is_nan),
                 # Saving the model and the log separately is convenient,
                 # because loading the whole pickle takes quite some time.
-                Checkpoint(save_path, every_n_batches=500,
+                Checkpoint(save_path, every_n_batches=2000,
                            save_separately=["model", "log"]),
-                Printing(every_n_batches=1)])
+                Printing(every_n_batches=100)])
         main_loop.run()
     elif mode == "sample" or mode == "beam_search":
         chars = tensor.lmatrix("input")
