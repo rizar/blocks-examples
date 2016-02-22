@@ -169,7 +169,7 @@ def main(mode, save_path, num_batches, data_path=None):
         reverser.biases_init = Constant(0.0)
         reverser.push_initialization_config()
         reverser.encoder.weights_init = Orthogonal()
-        reverser.generator.recurrent.weights_init = Orthogonal()
+        reverser.generator.recurrent.transition.weights_init = Orthogonal()
 
         # Build the cost computation graph
         chars = tensor.lmatrix("features")
@@ -230,16 +230,16 @@ def main(mode, save_path, num_batches, data_path=None):
                 name + "_grad_norm"))
 
         # Construct the main loop and start training!
-        average_monitoring = TrainingDataMonitoring(
-            observables, prefix="average", every_n_batches=100)
         main_loop = MainLoop(
             model=model,
             data_stream=data_stream,
             algorithm=algorithm,
             extensions=[
-                Timing(),
-                TrainingDataMonitoring(observables, after_batch=True),
-                average_monitoring,
+                Timing(every_n_batches=100),
+                TrainingDataMonitoring(
+                    observables, prefix="average", every_n_batches=100),
+                TrainingDataMonitoring(
+                    [algorithm.total_gradient_norm], after_batch=True),
                 FinishAfter(after_n_batches=num_batches)
                 # This shows a way to handle NaN emerging during
                 # training: simply finish it.
