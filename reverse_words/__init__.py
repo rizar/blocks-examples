@@ -9,7 +9,7 @@ import operator
 import theano
 from six.moves import input
 from picklable_itertools.extras import equizip
-from theano import tensor
+from theano import tensor, Op
 
 from blocks.bricks import Tanh, Initializable, Linear, Brick
 from blocks.bricks.base import application
@@ -53,6 +53,13 @@ all_chars = ([chr(ord('a') + i) for i in range(26)] +
 code2char = dict(enumerate(all_chars))
 char2code = {v: k for k, v in code2char.items()}
 
+COPY = 0
+INSERTION = 1
+DELETION = 2
+SUBSTITUTION = 3
+
+INFINITY = 10 ** 9
+
 
 def reverse_words(sample):
     sentence = sample[0]
@@ -81,16 +88,123 @@ def _transpose(data):
 def _filter_long(data):
     return len(data[0]) <= 100
 
-
 def _is_nan(log):
     return math.isnan(log.current_row['total_gradient_norm'])
 
+def _edit_distance_matrix(y, y_hat):
+    """Returns the matrix of edit distances.
 
-class EditDistance(Brick):
+    Returns
+    -------
+    dist : numpy.ndarray
+        dist[i, j] is the edit distance between the first
+    action : numpy.ndarray
+        action[i, j] is the action applied to y_hat[j - 1]  in a chain of
+        optimal actions transducing y_hat[:j] into y[:i].
+        i characters of y and the first j characters of y_hat.
+
+    """
+    dist = numpy.zeros((len(y) + 1, len(y_hat) + 1), dtype='int64')
+    action = dist.copy()
+    for i in xrange(len(y) + 1):
+        dist[i][0] = i
+    for j in xrange(len(y_hat) + 1):
+        dist[0][j] = j
+
+    for i in xrange(1, len(y) + 1):
+        for j in xrange(1, len(y_hat) + 1):
+            if y[i - 1] != y_hat[j - 1]:
+                cost = 1
+            else:
+                cost = 0
+            insertion_dist = dist[i - 1][j] + 1
+            deletion_dist = dist[i][j - 1] + 1
+            substitution_dist = dist[i - 1][j - 1] + 1 if cost else INFINITY
+            copy_dist = dist[i - 1][j - 1] if not cost else INFINITY
+            best = min(insertion_dist, deletion_dist,
+                       substitution_dist, copy_dist)
+
+            dist[i][j] = best
+            if best == insertion_dist:
+                action[i][j] = action[i - 1][j]
+            if best == deletion_dist:
+                action[i][j] = DELETION
+            if best == substitution_dist:
+                action[i][j] = SUBSTITUTION
+            if best == copy_dist:
+                action[i][j] = COPY
+
+    return dist, action
+
+
+def edit_distance(y, y_hat):
+    """Edit distance between two sequences.
+
+    Parameters
+    ----------
+    y : str
+        The groundtruth.
+    y_hat : str
+        The recognition candidate.
+
+   the minimum number of symbol edits (i.e. insertions,
+    deletions or substitutions) required to change one
+    word into the other.
+
+    """
+    return _edit_distance_matrix(y, y_hat)[0][-1, -1]
+
+
+class EditDistanceOp(Op):
+    __props__ = ()
+
+    def trim(self, y, mask):
+        try:
+            return y[:mask.index(0.) + 1]
+        except ValueError:
+            return y
+
+    def perform(self, node, inputs, output_storage):
+        prediction, prediction_mask, groundtruth, groundtruth_mask = inputs
+        if (groundtruth.ndim != 2 or prediction.ndim != 2
+                or groundtruth.shape[1] != prediction.shape[1]):
+            raise ValueError
+        batch_size = groundtruth.shape[1]
+
+        results = numpy.zeros_like(prediction[:, :, None])
+        for index in range(batch_size):
+            y = self.trim(list(groundtruth[:, index]),
+                          list(groundtruth_mask[:, index]))
+            y_hat = self.trim(list(prediction[:, index]),
+                              list(prediction_mask[:, index]))
+            results[len(y_hat) - 1, index, 0] = edit_distance(y, y_hat)
+
+        output_storage[0][0] = results
+
+    def grad(self, *args, **kwargs):
+        return theano.gradient.disconnected_type()
+
+    def make_node(self, prediction, prediction_mask,
+                  groundtruth, groundtruth_mask):
+        prediction = tensor.as_tensor_variable(prediction)
+        prediction_mask = tensor.as_tensor_variable(prediction_mask)
+        groundtruth = tensor.as_tensor_variable(groundtruth)
+        groundtruth_mask = tensor.as_tensor_variable(groundtruth_mask)
+        return theano.Apply(
+            self, [prediction, prediction_mask,
+                   groundtruth, groundtruth_mask], [tensor.ltensor3()])
+
+
+class EditDistanceReward(Brick):
+
+    def __init__(self, **kwargs):
+        super(EditDistanceReward, self).__init__(**kwargs)
+        self.op = EditDistanceOp()
 
     def apply(self, prediction, prediction_mask,
               groundtruth, groundtruth_mask):
-        return tensor.ones_like(prediction)[:, :, None]
+        return -self.op(prediction, prediction_mask,
+                        groundtruth, groundtruth_mask)
 
 
 class ReinforceReadout(SoftmaxReadout):
@@ -204,7 +318,7 @@ class WordReverser(Initializable):
         recurrent_att_baselined = WithBaseline(
             recurrent_att, state_to_use=recurrent.apply.states[0])
         readout = ReinforceReadout(
-            EditDistance(),
+            EditDistanceReward(),
             dim=alphabet_size,
             merged_states=[recurrent.apply.states[0],
                            attention.take_glimpses.outputs[0]],
@@ -224,6 +338,16 @@ class WordReverser(Initializable):
         self.baseline_readout = baseline_readout
         self.children = [fork, lookup, encoder, generator, baseline_readout]
 
+    def mask_for_prediction(self, prediction):
+        prediction_mask = tensor.lt(
+            tensor.cumsum(tensor.eq(prediction, char2code['</S>'])
+                          .astype(theano.config.floatX), axis=0),
+            1).astype(floatX)
+        prediction_mask = tensor.roll(prediction_mask, 1, 0)
+        prediction_mask = tensor.set_subtensor(
+            prediction_mask[0, :], tensor.ones_like(prediction_mask[0, :]))
+        return prediction_mask
+
     @application
     def costs(self, chars, chars_mask, targets, targets_mask):
         attended = self.encoder.apply(
@@ -234,8 +358,16 @@ class WordReverser(Initializable):
             self.baseline_readout.apply(
                 theano.gradient.disconnected_grad(attended)) *
                 theano.gradient.disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
+        prediction = theano.gradient.disconnected_grad(
+            self.generator.generate(
+                n_steps=2 * chars.shape[0], batch_size=chars.shape[1],
+                attended=attended,
+                attended_mask=chars_mask,
+                initial_baselines=initial_baselines)[0])
+        prediction_mask = self.mask_for_prediction(prediction)
         return self.generator.costs(
-            targets, targets_mask,
+            prediction=prediction, prediction_mask=prediction_mask,
+            groundtruth=targets, groundtruth_mask=targets_mask,
             attended=attended,
             attended_mask=chars_mask,
             initial_baselines=initial_baselines)
@@ -276,12 +408,30 @@ def main(mode, save_path, num_batches, data_path=None):
         reverser.encoder.weights_init = Orthogonal()
         # It is very ugly, but so far we do not have recurrent_weights_init
         reverser.generator.recurrent.recurrent.transition.weights_init = Orthogonal()
+        reverser.initialize()
 
         # Build the cost computation graph
         chars = tensor.lmatrix("features")
         chars_mask = tensor.matrix("features_mask")
         targets = tensor.lmatrix("targets")
         targets_mask = tensor.matrix("targets_mask")
+
+        if 1:
+            bos = char2code['<S>']
+            eos = char2code['</S>']
+            spc = char2code[' ']
+            chars.tag.test_value = numpy.array(
+                [[bos, 3, 4, 5, eos, 0, 0, 0, 0  ],
+                 [bos, 1, 2, 3, spc, 4, 5, 6, eos]]).T
+            chars_mask.tag.test_value = numpy.array(
+                [[1  , 1, 1, 1, 1,   0, 0, 0, 0],
+                 [1  , 1, 1, 1, 1,   1, 1, 1, 1]], dtype=theano.config.floatX).T
+            targets.tag.test_value = numpy.array(
+                [[bos, 5, 4, 3, eos, 0, 0, 0, 0  ],
+                 [bos, 3, 2, 1, spc, 6, 5, 4, eos]]).T
+            targets_mask.tag.test_value = chars_mask.tag.test_value
+            theano.config.compute_test_value = 'warn'
+            theano.config.print_test_value = True
         # Smart averaging of the training cost makes us immune
         # to batches of different size
         batch_cost = reverser.costs(
@@ -300,15 +450,13 @@ def main(mode, save_path, num_batches, data_path=None):
                          in parameters.items()],
                         width=120))
 
-        # Initialize parameters
-        for brick in model.get_top_bricks():
-            brick.initialize()
-
         # Define the training algorithm.
         cg = ComputationGraph(cost)
+        assert cg.updates
         algorithm = GradientDescent(
             cost=cost, parameters=cg.parameters,
             step_rule=CompositeRule([StepClipping(10.0), Scale(0.01)]))
+        algorithm.updates += cg.updates.items()
 
         # Fetch variables useful for debugging
         generator = reverser.generator
