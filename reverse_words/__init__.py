@@ -11,6 +11,7 @@ from six.moves import input
 from picklable_itertools.extras import equizip
 from theano import tensor, Op
 
+import blocks.roles
 from blocks.bricks import Tanh, Initializable, Linear, Brick
 from blocks.bricks.base import application
 from blocks.bricks.lookup import LookupTable
@@ -26,10 +27,11 @@ from blocks.graph import ComputationGraph
 from fuel.transformers import Mapping, Batch, Padding, Filter
 from fuel.datasets import OneBillionWord, TextFile
 from fuel.schemes import ConstantScheme
-from blocks.serialization import load_parameter_values
+from blocks.serialization import load_parameters
 from blocks.algorithms import (GradientDescent, Scale,
                                StepClipping, CompositeRule)
 from blocks.initialization import Orthogonal, IsotropicGaussian, Constant
+from blocks.monitoring.aggregation import MonitoredQuantity
 from blocks.model import Model
 from blocks.monitoring import aggregation
 from blocks.extensions import FinishAfter, Printing, Timing
@@ -155,14 +157,16 @@ def edit_distance(y, y_hat):
     return _edit_distance_matrix(y, y_hat)[0][-1, -1]
 
 
+def trim(y, mask):
+    try:
+        return y[:mask.index(0.)]
+    except ValueError:
+        return y
+
+
 class EditDistanceOp(Op):
     __props__ = ()
 
-    def trim(self, y, mask):
-        try:
-            return y[:mask.index(0.) + 1]
-        except ValueError:
-            return y
 
     def perform(self, node, inputs, output_storage):
         prediction, prediction_mask, groundtruth, groundtruth_mask = inputs
@@ -173,10 +177,10 @@ class EditDistanceOp(Op):
 
         results = numpy.zeros_like(prediction[:, :, None])
         for index in range(batch_size):
-            y = self.trim(list(groundtruth[:, index]),
-                          list(groundtruth_mask[:, index]))
-            y_hat = self.trim(list(prediction[:, index]),
-                              list(prediction_mask[:, index]))
+            y = trim(list(groundtruth[:, index]),
+                     list(groundtruth_mask[:, index]))
+            y_hat = trim(list(prediction[:, index]),
+                         list(prediction_mask[:, index]))
             results[len(y_hat) - 1, index, 0] = edit_distance(y, y_hat)
 
         output_storage[0][0] = results
@@ -201,6 +205,7 @@ class EditDistanceReward(Brick):
         super(EditDistanceReward, self).__init__(**kwargs)
         self.op = EditDistanceOp()
 
+    @application
     def apply(self, prediction, prediction_mask,
               groundtruth, groundtruth_mask):
         return -self.op(prediction, prediction_mask,
@@ -220,7 +225,7 @@ class ReinforceReadout(SoftmaxReadout):
         self.costs.inputs += [self.baselines]
 
     @application
-    def costs(self, prediction, prediction_mask,
+    def costs(self, application_call, prediction, prediction_mask,
               groundtruth, groundtruth_mask,
               **all_states):
         rewards = self.reward_brick.apply(prediction, prediction_mask,
@@ -230,15 +235,16 @@ class ReinforceReadout(SoftmaxReadout):
         baselines = all_states.pop(self.baselines)
         future_rewards = rewards.cumsum(axis=0)[::-1]
         centered_future_rewards = (future_rewards - baselines).sum(axis=-1)
-        cost = (centered_future_rewards ** 2).sum(axis=0)
+        costs = (centered_future_rewards ** 2).sum(axis=0)
+        application_call.add_auxiliary_variable(costs, name='baseline_errors')
         # The gradient of this will be the REINFORCE 1-sample
         # gradient estimate
         log_probs = self.all_scores(prediction, **all_states)
         if not prediction_mask:
             prediction_mask = 1
-        cost += (centered_future_rewards * (-log_probs)
+        costs += (centered_future_rewards * (-log_probs)
                  * prediction_mask).sum(axis=0)
-        return cost
+        return costs
 
 
 class WithBaseline(BaseRecurrent, Initializable):
@@ -290,6 +296,7 @@ class WithBaseline(BaseRecurrent, Initializable):
     def initial_states(self, batch_size, *args, **kwargs):
         return (self.recurrent.initial_states(batch_size, *args, **kwargs)
                 + [kwargs[self.initial_baselines]])
+
 
 class WordReverser(Initializable):
     """The top brick.
@@ -382,7 +389,22 @@ class WordReverser(Initializable):
             attended_mask=tensor.ones(chars.shape))
 
 
-def main(mode, save_path, num_batches, data_path=None):
+class Prediction(MonitoredQuantity):
+
+    def initialize(self):
+        self.result = None
+
+    def accumulate(self, prediction, prediction_mask):
+        self.result = [
+            "".join(
+                [code2char[code] for code in trim(
+                 list(prediction[:, i]), list(prediction_mask[:, i]))])
+            for i in range(prediction.shape[1])]
+
+    def readout(self):
+        return self.result
+
+def main(mode, save_path, num_batches, print_frequency=1, data_path=None):
     reverser = WordReverser(100, len(char2code), name="reverser")
 
     if mode == "train":
@@ -460,12 +482,23 @@ def main(mode, save_path, num_batches, data_path=None):
 
         # Fetch variables useful for debugging
         generator = reverser.generator
-        (energies,) = VariableFilter(
+        energies, = VariableFilter(
             applications=[generator.readout._merge],
             name_regex="output")(cg.variables)
-        (activations,) = VariableFilter(
+        activations, = VariableFilter(
             applications=[generator.recurrent.apply],
-            name=generator.recurrent.apply.states[0])(cg.variables)
+            name=generator.recurrent.apply.states[0])(cg)
+        rewards, = VariableFilter(
+            bricks=[EditDistanceReward],
+            roles=[blocks.roles.OUTPUT])(cg.variables)
+        baseline_error, = VariableFilter(
+            bricks=[ReinforceReadout], name='baseline_errors')(cg)
+        mean_baseline_error = baseline_error.mean().copy('mean_baseline_error')
+        prediction, = VariableFilter(
+            applications=[generator.costs], name='prediction')(cg)
+        prediction_mask, = VariableFilter(
+            applications=[generator.costs], name='prediction_mask')(cg)
+        mean_reward = rewards.sum(axis=0).mean().copy('mean_reward')
         max_length = chars.shape[0].copy(name="max_length")
         cost_per_character = aggregation.mean(
             batch_cost, batch_size * max_length).copy(
@@ -475,13 +508,17 @@ def main(mode, save_path, num_batches, data_path=None):
         mean_activation = abs(activations).mean().copy(
                 name="mean_activation")
         observables = [
-            cost, min_energy, max_energy, mean_activation,
+            cost,
+            mean_reward, mean_baseline_error,
+            #min_energy, max_energy, mean_activation,
             batch_size, max_length, cost_per_character,
             algorithm.total_step_norm, algorithm.total_gradient_norm]
-        for name, parameter in parameters.items():
-            observables.append(parameter.norm(2).copy(name + "_norm"))
-            observables.append(algorithm.gradients[parameter].norm(2).copy(
-                name + "_grad_norm"))
+        observables += [Prediction(requires=[prediction, prediction_mask],
+                                   name='prediction')]
+        # for name, parameter in parameters.items():
+        #     observables.append(parameter.norm(2).copy(name + "_norm"))
+        #     observables.append(algorithm.gradients[parameter].norm(2).copy(
+        #         name + "_grad_norm"))
 
         # Construct the main loop and start training!
         main_loop = MainLoop(
@@ -489,9 +526,9 @@ def main(mode, save_path, num_batches, data_path=None):
             data_stream=data_stream,
             algorithm=algorithm,
             extensions=[
-                Timing(every_n_batches=100),
+                Timing(every_n_batches=print_frequency),
                 TrainingDataMonitoring(
-                    observables, prefix="average", every_n_batches=100),
+                    observables, prefix="average", every_n_batches=print_frequency),
                 TrainingDataMonitoring(
                     [algorithm.total_gradient_norm], after_batch=True),
                 FinishAfter(after_n_batches=num_batches)
@@ -502,14 +539,14 @@ def main(mode, save_path, num_batches, data_path=None):
                 # because loading the whole pickle takes quite some time.
                 Checkpoint(save_path, every_n_batches=2000,
                            save_separately=["model", "log"]),
-                Printing(every_n_batches=100)])
+                Printing(every_n_batches=print_frequency)])
         main_loop.run()
     elif mode == "sample" or mode == "beam_search":
         chars = tensor.lmatrix("input")
         generated = reverser.generate(chars)
         model = Model(generated)
         logger.info("Loading the model..")
-        model.set_parameter_values(load_parameter_values(save_path))
+        model.set_parameter_values(load_parameters(open(save_path)))
 
         def generate(input_):
             """Generate output sequences for an input sequence.
