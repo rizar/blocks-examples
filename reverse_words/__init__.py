@@ -389,17 +389,17 @@ class WordReverser(Initializable):
             attended_mask=tensor.ones(chars.shape))
 
 
-class Prediction(MonitoredQuantity):
+class Strings(MonitoredQuantity):
 
     def initialize(self):
         self.result = None
 
-    def accumulate(self, prediction, prediction_mask):
+    def accumulate(self, string, mask):
         self.result = [
             "".join(
                 [code2char[code] for code in trim(
-                 list(prediction[:, i]), list(prediction_mask[:, i]))])
-            for i in range(prediction.shape[1])]
+                 list(string[:, i]), list(mask[:, i]))])
+            for i in range(string.shape[1])]
 
     def readout(self):
         return self.result
@@ -410,9 +410,10 @@ class Baselines(MonitoredQuantity):
     def initialize(self):
         self.result = None
 
-    def accumulate(self, baselines, prediction_mask):
+    def accumulate(self, baselines, mask):
         self.result = [
-            trim(list(baselines[:, i]), list(prediction_mask[:, i]))
+            trim(list(baselines[:, i].squeeze()),
+                 list(mask[:, i]))
             for i in range(baselines.shape[1])]
 
     def readout(self):
@@ -420,7 +421,7 @@ class Baselines(MonitoredQuantity):
 
 
 def main(mode, save_path, num_batches,
-         print_frequency=1, test_values=False, data_path=None):
+         print_frequency=1, test_values=True, data_path=None):
     reverser = WordReverser(100, len(char2code), name="reverser")
 
     if mode == "train":
@@ -531,9 +532,11 @@ def main(mode, save_path, num_batches,
             #min_energy, max_energy, mean_activation,
             batch_size, max_length, cost_per_character,
             algorithm.total_step_norm, algorithm.total_gradient_norm]
-        observables += [Prediction(requires=[prediction, prediction_mask],
-                                   name='prediction')]
-        observables += [Baselines(requires=[baselines, prediction_mask],
+        observables += [Strings(requires=[prediction, prediction_mask],
+                                   name='prediction'),
+                        Strings(requires=[targets, targets_mask],
+                                   name='groundtruth'),
+                        Baselines(requires=[baselines, prediction_mask],
                                   name='baselines')]
         # for name, parameter in parameters.items():
         #     observables.append(parameter.norm(2).copy(name + "_norm"))
