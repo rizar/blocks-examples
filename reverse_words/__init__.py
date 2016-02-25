@@ -404,7 +404,23 @@ class Prediction(MonitoredQuantity):
     def readout(self):
         return self.result
 
-def main(mode, save_path, num_batches, print_frequency=1, data_path=None):
+
+class Baselines(MonitoredQuantity):
+
+    def initialize(self):
+        self.result = None
+
+    def accumulate(self, baselines, prediction_mask):
+        self.result = [
+            trim(list(baselines[:, i]), list(prediction_mask[:, i]))
+            for i in range(baselines.shape[1])]
+
+    def readout(self):
+        return self.result
+
+
+def main(mode, save_path, num_batches,
+         print_frequency=1, test_values=False, data_path=None):
     reverser = WordReverser(100, len(char2code), name="reverser")
 
     if mode == "train":
@@ -438,7 +454,7 @@ def main(mode, save_path, num_batches, print_frequency=1, data_path=None):
         targets = tensor.lmatrix("targets")
         targets_mask = tensor.matrix("targets_mask")
 
-        if 1:
+        if test_values:
             bos = char2code['<S>']
             eos = char2code['</S>']
             spc = char2code[' ']
@@ -491,6 +507,8 @@ def main(mode, save_path, num_batches, print_frequency=1, data_path=None):
         rewards, = VariableFilter(
             bricks=[EditDistanceReward],
             roles=[blocks.roles.OUTPUT])(cg.variables)
+        baselines, = VariableFilter(
+            applications=[generator.costs], name='baselines')(cg)
         baseline_error, = VariableFilter(
             bricks=[ReinforceReadout], name='baseline_errors')(cg)
         mean_baseline_error = baseline_error.mean().copy('mean_baseline_error')
@@ -515,6 +533,8 @@ def main(mode, save_path, num_batches, print_frequency=1, data_path=None):
             algorithm.total_step_norm, algorithm.total_gradient_norm]
         observables += [Prediction(requires=[prediction, prediction_mask],
                                    name='prediction')]
+        observables += [Baselines(requires=[baselines, prediction_mask],
+                                  name='baselines')]
         # for name, parameter in parameters.items():
         #     observables.append(parameter.norm(2).copy(name + "_norm"))
         #     observables.append(algorithm.gradients[parameter].norm(2).copy(
