@@ -120,7 +120,7 @@ class ReinforceReadout(SoftmaxReadout):
 
         # Baseline error part
         baselines = all_states.pop(self.baselines)
-        future_rewards = rewards.cumsum(axis=0)[::-1]
+        future_rewards = rewards[::-1].cumsum(axis=0)[::-1]
         centered_future_rewards = (future_rewards - baselines).sum(axis=-1)
         costs = (centered_future_rewards ** 2).sum(axis=0)
         application_call.add_auxiliary_variable(costs, name='baseline_errors')
@@ -254,7 +254,8 @@ class WordReverser(Initializable):
                 theano.gradient.disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
         prediction = theano.gradient.disconnected_grad(
             self.generator.generate(
-                n_steps=2 * chars.shape[0], batch_size=chars.shape[1],
+                n_steps=3,#2 * chars.shape[0],
+                batch_size=chars.shape[1],
                 attended=attended,
                 attended_mask=chars_mask,
                 initial_baselines=initial_baselines)[0])
@@ -269,7 +270,8 @@ class WordReverser(Initializable):
     @application
     def generate(self, chars):
         return self.generator.generate(
-            n_steps=3 * chars.shape[0], batch_size=chars.shape[1],
+            3 * chars.shape[0],
+            batch_size=chars.shape[1],
             attended=self.encoder.apply(
                 **dict_union(
                     self.fork.apply(self.lookup.apply(chars), as_dict=True))),
@@ -381,7 +383,7 @@ def main(mode, save_path, num_batches,
         assert cg.updates
         algorithm = GradientDescent(
             cost=cost, parameters=cg.parameters,
-            step_rule=CompositeRule([StepClipping(10.0), Scale(0.01)]))
+            step_rule=CompositeRule([StepClipping(10000.0), Scale(0.000001)]))
         algorithm.updates += cg.updates.items()
 
         # Fetch variables useful for debugging
@@ -395,6 +397,10 @@ def main(mode, save_path, num_batches,
         rewards, = VariableFilter(
             bricks=[EditDistanceReward],
             roles=[blocks.roles.OUTPUT])(cg.variables)
+        rewards = rewards.sum(axis=0).sum(axis=-1).copy(name='rewards')
+        initial_baselines, = VariableFilter(
+            applications=[generator.costs], name='initial_baselines')(cg)
+        initial_baselines = initial_baselines.sum(axis=-1).copy(name='initial_baselines')
         baselines, = VariableFilter(
             applications=[generator.costs], name='baselines')(cg)
         baseline_error, = VariableFilter(
@@ -404,7 +410,6 @@ def main(mode, save_path, num_batches,
             applications=[generator.costs], name='prediction')(cg)
         prediction_mask, = VariableFilter(
             applications=[generator.costs], name='prediction_mask')(cg)
-        mean_reward = rewards.sum(axis=0).mean().copy('mean_reward')
         max_length = chars.shape[0].copy(name="max_length")
         cost_per_character = aggregation.mean(
             batch_cost, batch_size * max_length).copy(
@@ -415,7 +420,7 @@ def main(mode, save_path, num_batches,
                 name="mean_activation")
         observables = [
             cost,
-            mean_reward, mean_baseline_error,
+            rewards, initial_baselines, mean_baseline_error,
             #min_energy, max_energy, mean_activation,
             batch_size, max_length, cost_per_character,
             algorithm.total_step_norm, algorithm.total_gradient_norm]
