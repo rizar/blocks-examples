@@ -8,10 +8,13 @@ import operator
 
 import theano
 from theano import tensor
+from theano.gradient import disconnected_grad
 from six.moves import input
 from picklable_itertools.extras import equizip
 
 import blocks.roles
+from blocks.select import Selector
+from blocks.theano_expressions import l2_norm
 from blocks.bricks import Tanh, Initializable, Linear, Brick
 from blocks.bricks.base import application
 from blocks.bricks.lookup import LookupTable
@@ -28,7 +31,7 @@ from fuel.transformers import Mapping, Batch, Padding, Filter
 from fuel.datasets import OneBillionWord, TextFile
 from fuel.schemes import ConstantScheme
 from blocks.serialization import load_parameters
-from blocks.algorithms import (GradientDescent, Scale,
+from blocks.algorithms import (GradientDescent, Scale, Restrict,
                                StepClipping, CompositeRule)
 from blocks.initialization import Orthogonal, IsotropicGaussian, Constant
 from blocks.monitoring.aggregation import MonitoredQuantity
@@ -55,6 +58,9 @@ all_chars = ([chr(ord('a') + i) for i in range(26)] +
              [' ', '<S>', '</S>'])
 code2char = dict(enumerate(all_chars))
 char2code = {v: k for k, v in code2char.items()}
+bos = char2code['<S>']
+eos = char2code['</S>']
+spc = char2code[' ']
 
 def reverse_words(sample):
     sentence = sample[0]
@@ -71,6 +77,15 @@ def reverse_words(sample):
                 word_start = i
     return (result,)
 
+def copy_words(sample):
+    return (sample[0],)
+
+def _shorten(sample):
+    text, = sample
+    if len(text) > 5:
+        text = text[:5]
+        text[-1] = char2code['</S>']
+    return (text,)
 
 def _lower(s):
     return s.lower()
@@ -115,21 +130,24 @@ class ReinforceReadout(SoftmaxReadout):
     def costs(self, application_call, prediction, prediction_mask,
               groundtruth, groundtruth_mask,
               **all_states):
+        log_probs = self.all_scores(prediction, **all_states)
         rewards = self.reward_brick.apply(prediction, prediction_mask,
-                                          groundtruth, groundtruth_mask)
+                                          groundtruth, groundtruth_mask).sum(axis=-1)
+        # Encourage entropy
+        rewards += 0.1 * disconnected_grad(-log_probs * prediction_mask)
 
         # Baseline error part
-        baselines = all_states.pop(self.baselines)
+        baselines = all_states.pop(self.baselines).sum(axis=-1)
         future_rewards = rewards[::-1].cumsum(axis=0)[::-1]
-        centered_future_rewards = (future_rewards - baselines).sum(axis=-1)
-        costs = (centered_future_rewards ** 2).sum(axis=0)
-        application_call.add_auxiliary_variable(costs, name='baseline_errors')
+        centered_future_rewards = future_rewards - baselines
+        baseline_errors = ((centered_future_rewards *
+                  disconnected_grad(prediction_mask)) ** 2).sum(axis=0)
+        application_call.add_auxiliary_variable(
+            baseline_errors, name='baseline_errors')
         # The gradient of this will be the REINFORCE 1-sample
         # gradient estimate
-        log_probs = self.all_scores(prediction, **all_states)
-        if not prediction_mask:
-            prediction_mask = 1
-        costs += (centered_future_rewards * (-log_probs)
+        costs = (disconnected_grad(centered_future_rewards)
+                 * (-log_probs)
                  * prediction_mask).sum(axis=0)
         return costs
 
@@ -166,7 +184,7 @@ class WithBaseline(BaseRecurrent, Initializable):
         # ReinforceReadout.
         kwargs.pop('baselines')
         initial_baselines = kwargs.pop(self.initial_baselines)
-        states = theano.gradient.disconnected_grad(kwargs[self.state_to_use])
+        states = disconnected_grad(kwargs[self.state_to_use])
         baselines = initial_baselines + self.baseline_predictor.apply(states)
         outputs = (self.recurrent.apply(iterate=False, as_list=True, **kwargs)
                    + [baselines])
@@ -223,7 +241,7 @@ class WordReverser(Initializable):
         generator = SequenceGenerator(
             recurrent_att_baselined, readout, feedback,
             name="generator")
-        baseline_readout = Linear(2 * dimension, 1)
+        baseline_readout = Linear(2 * dimension, 1, name='baseline_readout')
 
         self.fork = fork
         self.lookup = lookup
@@ -250,11 +268,11 @@ class WordReverser(Initializable):
                 mask=chars_mask))
         initial_baselines = (
             self.baseline_readout.apply(
-                theano.gradient.disconnected_grad(attended)) *
-                theano.gradient.disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
+                disconnected_grad(attended)) *
+                disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
         prediction = theano.gradient.disconnected_grad(
             self.generator.generate(
-                n_steps=3,#2 * chars.shape[0],
+                n_steps=5,#2 * chars.shape[0],
                 batch_size=chars.shape[1],
                 attended=attended,
                 attended_mask=chars_mask,
@@ -269,12 +287,14 @@ class WordReverser(Initializable):
 
     @application
     def generate(self, chars):
+        attended = self.encoder.apply(
+            **dict_union(
+                self.fork.apply(self.lookup.apply(chars), as_dict=True)))
         return self.generator.generate(
-            3 * chars.shape[0],
+            n_steps=3 * chars.shape[0],
             batch_size=chars.shape[1],
-            attended=self.encoder.apply(
-                **dict_union(
-                    self.fork.apply(self.lookup.apply(chars), as_dict=True))),
+            initial_baselines=self.baseline_readout.apply(attended).sum(axis=0),
+            attended=attended,
             attended_mask=tensor.ones(chars.shape))
 
 
@@ -310,8 +330,13 @@ class Baselines(MonitoredQuantity):
 
 
 def main(mode, save_path, num_batches,
-         print_frequency=1, test_values=False, data_path=None):
+         print_frequency=1, verbose=False, test_values=False, data_path=None):
+    if test_values:
+        theano.config.compute_test_value = 'warn'
+        theano.config.print_test_value = True
+
     reverser = WordReverser(100, len(char2code), name="reverser")
+    generator = reverser.generator
 
     if mode == "train":
         # Data processing pipeline
@@ -322,8 +347,11 @@ def main(mode, save_path, num_batches,
         else:
             dataset = OneBillionWord("training", [99], **dataset_options)
         data_stream = dataset.get_example_stream()
-        data_stream = Filter(data_stream, _filter_long)
-        data_stream = Mapping(data_stream, reverse_words,
+        #data_stream = Filter(data_stream, _filter_long)
+        #data_stream = Mapping(data_stream, reverse_words,
+                              #add_sources=("targets",))
+        data_stream = Mapping(data_stream, _shorten)
+        data_stream = Mapping(data_stream, copy_words,
                               add_sources=("targets",))
         data_stream = Batch(data_stream, iteration_scheme=ConstantScheme(10))
         data_stream = Padding(data_stream)
@@ -343,23 +371,17 @@ def main(mode, save_path, num_batches,
         chars_mask = tensor.matrix("features_mask")
         targets = tensor.lmatrix("targets")
         targets_mask = tensor.matrix("targets_mask")
+        chars.tag.test_value = numpy.array(
+            [[bos, 3, 4, 5, eos, 0, 0, 0, 0  ],
+                [bos, 1, 2, 3, spc, 4, 5, 6, eos]]).T
+        chars_mask.tag.test_value = numpy.array(
+            [[1  , 1, 1, 1, 1,   0, 0, 0, 0],
+                [1  , 1, 1, 1, 1,   1, 1, 1, 1]], dtype=theano.config.floatX).T
+        targets.tag.test_value = numpy.array(
+            [[bos, 5, 4, 3, eos, 0, 0, 0, 0  ],
+                [bos, 3, 2, 1, spc, 6, 5, 4, eos]]).T
+        targets_mask.tag.test_value = chars_mask.tag.test_value
 
-        if test_values:
-            bos = char2code['<S>']
-            eos = char2code['</S>']
-            spc = char2code[' ']
-            chars.tag.test_value = numpy.array(
-                [[bos, 3, 4, 5, eos, 0, 0, 0, 0  ],
-                 [bos, 1, 2, 3, spc, 4, 5, 6, eos]]).T
-            chars_mask.tag.test_value = numpy.array(
-                [[1  , 1, 1, 1, 1,   0, 0, 0, 0],
-                 [1  , 1, 1, 1, 1,   1, 1, 1, 1]], dtype=theano.config.floatX).T
-            targets.tag.test_value = numpy.array(
-                [[bos, 5, 4, 3, eos, 0, 0, 0, 0  ],
-                 [bos, 3, 2, 1, spc, 6, 5, 4, eos]]).T
-            targets_mask.tag.test_value = chars_mask.tag.test_value
-            theano.config.compute_test_value = 'warn'
-            theano.config.print_test_value = True
         # Smart averaging of the training cost makes us immune
         # to batches of different size
         batch_cost = reverser.costs(
@@ -380,14 +402,32 @@ def main(mode, save_path, num_batches,
 
         # Define the training algorithm.
         cg = ComputationGraph(cost)
+        baseline_errors, = VariableFilter(
+            bricks=[ReinforceReadout], name='baseline_errors')(cg)
+        mean_baseline_error = baseline_errors.mean().copy('mean_baseline_error')
         assert cg.updates
+        baseline_parameters = list(Selector([
+            reverser.baseline_readout, generator.recurrent.baseline_predictor])
+            .get_parameters().values())
+        normal_parameters = [p for p in cg.parameters if p not in baseline_parameters]
         algorithm = GradientDescent(
-            cost=cost, parameters=cg.parameters,
-            step_rule=CompositeRule([StepClipping(10000.0), Scale(0.000001)]))
+            cost=cost + mean_baseline_error,
+            parameters=cg.parameters,
+            step_rule=CompositeRule([
+                Restrict(CompositeRule([StepClipping(100.0), Scale(0.01)]),
+                         normal_parameters),
+                Restrict(CompositeRule([Scale(1e-6)]),
+                         baseline_parameters)]))
+        baseline_gradient_norm = l2_norm(
+            [algorithm.gradients[p] for p in baseline_parameters]).copy(
+                name='baseline_gradient_norm')
+        normal_gradient_norm = l2_norm(
+            [algorithm.gradients[p] for p in normal_parameters]).copy(
+                name='normal_gradient_norm')
+
         algorithm.updates += cg.updates.items()
 
         # Fetch variables useful for debugging
-        generator = reverser.generator
         energies, = VariableFilter(
             applications=[generator.readout._merge],
             name_regex="output")(cg.variables)
@@ -403,9 +443,6 @@ def main(mode, save_path, num_batches,
         initial_baselines = initial_baselines.sum(axis=-1).copy(name='initial_baselines')
         baselines, = VariableFilter(
             applications=[generator.costs], name='baselines')(cg)
-        baseline_error, = VariableFilter(
-            bricks=[ReinforceReadout], name='baseline_errors')(cg)
-        mean_baseline_error = baseline_error.mean().copy('mean_baseline_error')
         prediction, = VariableFilter(
             applications=[generator.costs], name='prediction')(cg)
         prediction_mask, = VariableFilter(
@@ -420,44 +457,65 @@ def main(mode, save_path, num_batches,
                 name="mean_activation")
         observables = [
             cost,
-            rewards, initial_baselines, mean_baseline_error,
+            rewards.mean().copy('mean_reward'),
+            mean_baseline_error,
+            reverser.baseline_readout.b.copy(name='baseline_bias'),
+            algorithm.gradients[reverser.baseline_readout.b].copy(
+                name='baseline_bias_grad'),
             #min_energy, max_energy, mean_activation,
             batch_size, max_length, cost_per_character,
-            algorithm.total_step_norm, algorithm.total_gradient_norm]
-        observables += [Strings(requires=[prediction, prediction_mask],
-                                   name='prediction'),
-                        Strings(requires=[targets, targets_mask],
-                                   name='groundtruth'),
-                        Baselines(requires=[baselines, prediction_mask],
-                                  name='baselines')]
+            algorithm.total_step_norm, algorithm.total_gradient_norm,
+            baseline_gradient_norm, normal_gradient_norm]
+        #observables += [Strings(requires=[prediction, prediction_mask],
+                                   #name='prediction'),
+                        #Strings(requires=[targets, targets_mask],
+                                   #name='groundtruth'),
+                        #Baselines(requires=[baselines, prediction_mask],
+                                  #name='baselines')]
         # for name, parameter in parameters.items():
         #     observables.append(parameter.norm(2).copy(name + "_norm"))
         #     observables.append(algorithm.gradients[parameter].norm(2).copy(
         #         name + "_grad_norm"))
 
         # Construct the main loop and start training!
+        extensions=[Timing(every_n_batches=print_frequency)]
+        if verbose:
+            extensions += [
+                TrainingDataMonitoring(
+                    [Strings(requires=[prediction, prediction_mask],
+                            name='prediction'),
+                     Strings(requires=[targets, targets_mask],
+                            name='groundtruth'),
+                     Baselines(requires=[baselines, prediction_mask],
+                            name='baselines'),
+                     rewards, initial_baselines, mean_baseline_error],
+                    after_batch=True)]
+        extensions += [
+            TrainingDataMonitoring(
+                observables, every_n_batches=print_frequency),
+            TrainingDataMonitoring(
+                [algorithm.total_gradient_norm], after_batch=True),
+            FinishAfter(after_n_batches=num_batches)
+            # This shows a way to handle NaN emerging during
+            # training: simply finish it.
+            .add_condition(["after_batch"], _is_nan),
+            # Saving the model and the log separately is convenient,
+            # because loading the whole pickle takes quite some time.
+            Checkpoint(save_path, every_n_batches=2000,
+                        save_separately=["model", "log"]),
+            Printing(every_n_batches=print_frequency)]
         main_loop = MainLoop(
             model=model,
             data_stream=data_stream,
             algorithm=algorithm,
-            extensions=[
-                Timing(every_n_batches=print_frequency),
-                TrainingDataMonitoring(
-                    observables, prefix="average", every_n_batches=print_frequency),
-                TrainingDataMonitoring(
-                    [algorithm.total_gradient_norm], after_batch=True),
-                FinishAfter(after_n_batches=num_batches)
-                # This shows a way to handle NaN emerging during
-                # training: simply finish it.
-                .add_condition(["after_batch"], _is_nan),
-                # Saving the model and the log separately is convenient,
-                # because loading the whole pickle takes quite some time.
-                Checkpoint(save_path, every_n_batches=2000,
-                           save_separately=["model", "log"]),
-                Printing(every_n_batches=print_frequency)])
+            extensions=extensions)
         main_loop.run()
     elif mode == "sample" or mode == "beam_search":
         chars = tensor.lmatrix("input")
+        chars.tag.test_value = numpy.array(
+            [[bos, 3, 4, 5, eos, 0, 0, 0, 0  ],
+             [bos, 1, 2, 3, spc, 4, 5, 6, eos]]).T
+
         generated = reverser.generate(chars)
         model = Model(generated)
         logger.info("Loading the model..")
@@ -506,11 +564,11 @@ def main(mode, save_path, num_batches,
                     masks[:, i] = 0.
                     masks[:true_length, i] = 1.
                 # Sanity check
-                args = [input_, numpy.ones_like(input_).astype('float32'),
-                        samples, masks.astype('float32')]
-                args = [tensor.as_tensor_variable(arg) for arg in args]
-                costs2 = reverser.costs(*args).eval()
-                print(costs, costs2)
+                # args = [input_, numpy.ones_like(input_).astype('float32'),
+                #        samples, masks.astype('float32')]
+                # args = [tensor.as_tensor_variable(arg) for arg in args]
+                # costs2 = reverser.costs(*args).eval()
+                # print(costs, costs2)
             return outputs, costs
 
         while True:
