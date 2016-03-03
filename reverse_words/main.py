@@ -19,7 +19,7 @@ from blocks.bricks import Tanh, Initializable, Linear, Brick
 from blocks.bricks.base import application
 from blocks.bricks.lookup import LookupTable
 from blocks.bricks.recurrent import (
-    recurrent, BaseRecurrent, SimpleRecurrent, Bidirectional)
+    recurrent, BaseRecurrent, SimpleRecurrent, Bidirectional, GatedRecurrent)
 from blocks.bricks.attention import SequenceContentAttention
 from blocks.bricks.parallel import Fork
 from blocks_extras.bricks.sequence_generator2 import (
@@ -82,8 +82,8 @@ def copy_words(sample):
 
 def _shorten(sample):
     text, = sample
-    if len(text) > 5:
-        text = text[:5]
+    if len(text) > 20:
+        text = text[:20]
         text[-1] = char2code['</S>']
     return (text,)
 
@@ -116,10 +116,11 @@ class EditDistanceReward(Brick):
 
 class ReinforceReadout(SoftmaxReadout):
 
-    def __init__(self, reward_brick, baselines, **kwargs):
+    def __init__(self, reward_brick, baselines, entropy=None, **kwargs):
         super(ReinforceReadout, self).__init__(**kwargs)
         self.reward_brick = reward_brick
         self.baselines = baselines
+        self.entropy_coof = entropy
         self.children += [self.reward_brick]
 
         # The inputs of "costs" should be automagically set in
@@ -134,7 +135,10 @@ class ReinforceReadout(SoftmaxReadout):
         rewards = self.reward_brick.apply(prediction, prediction_mask,
                                           groundtruth, groundtruth_mask).sum(axis=-1)
         # Encourage entropy
-        rewards += 0.1 * disconnected_grad(-log_probs * prediction_mask)
+        sumlogs = disconnected_grad(-log_probs * prediction_mask)
+        application_call.add_auxiliary_variable(sumlogs, name='sumlogs')
+        if self.entropy_coof:
+            rewards += self.entropy_coof * sumlogs
 
         # Baseline error part
         baselines = all_states.pop(self.baselines).sum(axis=-1)
@@ -210,17 +214,17 @@ class WordReverser(Initializable):
     roof of a single top brick.
 
     """
-    def __init__(self, dimension, alphabet_size, **kwargs):
+    def __init__(self, dimension, alphabet_size, entropy, **kwargs):
         super(WordReverser, self).__init__(**kwargs)
         encoder = Bidirectional(
-            SimpleRecurrent(dim=dimension, activation=Tanh()))
+            GatedRecurrent(dim=dimension, activation=Tanh()))
         fork = Fork([name for name in encoder.prototype.apply.sequences
                     if name != 'mask'])
         fork.input_dim = dimension
         fork.output_dims = [encoder.prototype.get_dim(name) for name in fork.input_names]
         lookup = LookupTable(alphabet_size, dimension)
 
-        recurrent = SimpleRecurrent(
+        recurrent = GatedRecurrent(
             activation=Tanh(),
             dim=dimension, name="recurrent")
         attention = SequenceContentAttention(
@@ -231,12 +235,14 @@ class WordReverser(Initializable):
             recurrent_att, state_to_use=recurrent.apply.states[0])
         readout = ReinforceReadout(
             EditDistanceReward(),
+            entropy=entropy,
             dim=alphabet_size,
             merged_states=[recurrent.apply.states[0],
                            attention.take_glimpses.outputs[0]],
             baselines='baselines',
             name="readout")
-        feedback = Feedback(recurrent.apply.sequences[:-1],
+        feedback = Feedback([name for name in recurrent.apply.sequences
+                             if name != 'mask'],
                             embedding=LookupTable(alphabet_size, dimension))
         generator = SequenceGenerator(
             recurrent_att_baselined, readout, feedback,
@@ -272,7 +278,7 @@ class WordReverser(Initializable):
                 disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
         prediction = theano.gradient.disconnected_grad(
             self.generator.generate(
-                n_steps=5,#2 * chars.shape[0],
+                n_steps=20,#2 * chars.shape[0],
                 batch_size=chars.shape[1],
                 attended=attended,
                 attended_mask=chars_mask,
@@ -330,12 +336,14 @@ class Baselines(MonitoredQuantity):
 
 
 def main(mode, save_path, num_batches,
-         print_frequency=1, verbose=False, test_values=False, data_path=None):
+         print_frequency=1, verbose=False,
+         entropy=None,
+         test_values=False, data_path=None):
     if test_values:
         theano.config.compute_test_value = 'warn'
         theano.config.print_test_value = True
 
-    reverser = WordReverser(100, len(char2code), name="reverser")
+    reverser = WordReverser(100, len(char2code), entropy, name="reverser")
     generator = reverser.generator
 
     if mode == "train":
@@ -388,7 +396,7 @@ def main(mode, save_path, num_batches,
             chars, chars_mask, targets, targets_mask).sum()
         batch_size = chars.shape[1].copy(name="batch_size")
         cost = aggregation.mean(batch_cost, batch_size)
-        cost.name = "sequence_log_likelihood"
+        cost.name = "cost"
         logger.info("Cost graph is built")
 
         # Give an idea of what's going on
@@ -443,6 +451,8 @@ def main(mode, save_path, num_batches,
         initial_baselines = initial_baselines.sum(axis=-1).copy(name='initial_baselines')
         baselines, = VariableFilter(
             applications=[generator.costs], name='baselines')(cg)
+        sumlogs, = VariableFilter(
+            bricks=[ReinforceReadout], name='sumlogs')(cg)
         prediction, = VariableFilter(
             applications=[generator.costs], name='prediction')(cg)
         prediction_mask, = VariableFilter(
@@ -458,6 +468,7 @@ def main(mode, save_path, num_batches,
         observables = [
             cost,
             rewards.mean().copy('mean_reward'),
+            sumlogs.mean().copy('entropy'),
             mean_baseline_error,
             reverser.baseline_readout.b.copy(name='baseline_bias'),
             algorithm.gradients[reverser.baseline_readout.b].copy(

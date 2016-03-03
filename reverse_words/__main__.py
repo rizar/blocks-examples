@@ -36,8 +36,11 @@ if __name__ == "__main__":
         "--data-path",
         help="text file(s) to read for training, with bash-like expansion"
              " so wildchars can be used (e.g. data/*.txt)")
+    parser.add_argument("--entropy", type=float)
     parser.add_argument(
         "--test-values", action="store_true")
+    parser.add_argument(
+        "--verbose", action="store_true")
     parser.add_argument(
         "--print-frequency", type=int, default=100)
     args = parser.parse_args()
