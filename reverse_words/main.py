@@ -82,8 +82,8 @@ def copy_words(sample):
 
 def _shorten(sample):
     text, = sample
-    if len(text) > 20:
-        text = text[:20]
+    if len(text) > 5:
+        text = text[:5]
         text[-1] = char2code['</S>']
     return (text,)
 
@@ -278,7 +278,7 @@ class WordReverser(Initializable):
                 disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
         prediction = theano.gradient.disconnected_grad(
             self.generator.generate(
-                n_steps=20,#2 * chars.shape[0],
+                n_steps=5,#2 * chars.shape[0],
                 batch_size=chars.shape[1],
                 attended=attended,
                 attended_mask=chars_mask,
@@ -309,14 +309,14 @@ class Strings(MonitoredQuantity):
     def initialize(self):
         self.result = None
 
-    def accumulate(self, string, mask):
+    def aggregate(self, string, mask):
         self.result = [
             "".join(
                 [code2char[code] for code in trim(
                  list(string[:, i]), list(mask[:, i]))])
             for i in range(string.shape[1])]
 
-    def readout(self):
+    def get_aggregated_value(self):
         return self.result
 
 
@@ -325,13 +325,13 @@ class Baselines(MonitoredQuantity):
     def initialize(self):
         self.result = None
 
-    def accumulate(self, baselines, mask):
+    def aggregate(self, baselines, mask):
         self.result = [
             trim(list(baselines[:, i].squeeze()),
                  list(mask[:, i]))
             for i in range(baselines.shape[1])]
 
-    def readout(self):
+    def get_aggregated_value(self):
         return self.result
 
 
@@ -512,7 +512,7 @@ def main(mode, save_path, num_batches,
             .add_condition(["after_batch"], _is_nan),
             # Saving the model and the log separately is convenient,
             # because loading the whole pickle takes quite some time.
-            Checkpoint(save_path, every_n_batches=2000,
+            Checkpoint(save_path, every_n_batches=200,
                         save_separately=["model", "log"]),
             Printing(every_n_batches=print_frequency)]
         main_loop = MainLoop(
