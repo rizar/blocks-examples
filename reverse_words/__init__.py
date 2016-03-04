@@ -38,7 +38,7 @@ from blocks.main_loop import MainLoop
 from blocks.filter import VariableFilter
 from blocks.utils import dict_union
 
-from blocks.search import BeamSearch
+from blocks_extras.search import BeamSearch
 
 config.recursion_limit = 100000
 floatX = theano.config.floatX
@@ -274,8 +274,8 @@ def main(mode, save_path, num_batches, data_path=None):
             """
             if mode == "beam_search":
                 samples, = VariableFilter(
-                    applications=[reverser.generator.generate], name="outputs")(
-                        ComputationGraph(generated[1]))
+                    applications=[reverser.generator.generate], name="samples")(
+                        ComputationGraph(generated))
                 # NOTE: this will recompile beam search functions
                 # every time user presses Enter. Do not create
                 # a new `BeamSearch` object every time if
