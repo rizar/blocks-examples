@@ -42,7 +42,7 @@ from blocks.extensions.saveload import Checkpoint
 from blocks.extensions.monitoring import TrainingDataMonitoring
 from blocks.main_loop import MainLoop
 from blocks.filter import VariableFilter
-from blocks.utils import dict_union
+from blocks.utils import dict_union, dict_subset
 from blocks.search import BeamSearch
 
 from reverse_words.edit_distance import trim, EditDistanceOp
@@ -121,17 +121,32 @@ class ReinforceReadout(SoftmaxReadout):
         self.reward_brick = reward_brick
         self.baselines = baselines
         self.entropy_coof = entropy
-        self.children += [self.reward_brick]
+
+        self.value_summand = Linear(output_dim=1, name='summand')
+        self.value_adjustment = Linear(output_dim=1, name='adjustment')
+
+        self.children += [
+            reward_brick, self.value_summand, self.value_adjustment]
 
         # The inputs of "costs" should be automagically set in
         # SoftmaxReadout.__init__. But we should add "baselines"
-        self.costs.inputs += [self.baselines]
+        self.costs.inputs += [self.baselines, 'attended', 'attedned_mask']
+
+    def _push_allocation_config(self):
+        super(ReinforceReadout, self)._push_allocation_config()
+        self.value_summand.input_dim = self.get_dim('attended')
+        self.value_adjustment.input_dim = self.get_dim('states')
 
     @application
     def costs(self, application_call, prediction, prediction_mask,
               groundtruth, groundtruth_mask,
-              **all_states):
-        log_probs = self.all_scores(prediction, **all_states)
+              **inputs):
+        attended = disconnected_grad(inputs.pop('attended'))
+        attended_mask = disconnected_grad(inputs.pop('attended_mask'))
+        states = disconnected_grad(inputs['states'])
+
+        merged = self.merge(**dict_subset(inputs, self.merge_names))
+        log_probs = self.all_scores(prediction, merged)
         rewards = self.reward_brick.apply(prediction, prediction_mask,
                                           groundtruth, groundtruth_mask).sum(axis=-1)
         # Encourage entropy
@@ -140,71 +155,34 @@ class ReinforceReadout(SoftmaxReadout):
         if self.entropy_coof:
             rewards += self.entropy_coof * sumlogs
 
-        # Baseline error part
-        baselines = all_states.pop(self.baselines).sum(axis=-1)
+        # Compute baseline
+        baselines = (
+            self.value_summand.apply(attended)[:, :, 0]
+            * attended_mask).sum(axis=0)
+        application_call.add_auxiliary_variable(
+            baselines, name='initial_baselines')
+        baselines = tensor.repeat(baselines[None, :], merged.shape[0], axis=0)
+        baselines = tensor.inc_subtensor(
+            baselines[1:],
+            self.value_adjustment.apply(states)[:-1, :, 0])
+        application_call.add_auxiliary_variable(
+            baselines, name='baselines')
+
+        # Compute baseline error
         future_rewards = rewards[::-1].cumsum(axis=0)[::-1]
         centered_future_rewards = future_rewards - baselines
-        baseline_errors = ((centered_future_rewards *
-                  disconnected_grad(prediction_mask)) ** 2).sum(axis=0)
+        baseline_errors = (
+            (centered_future_rewards *
+            disconnected_grad(prediction_mask)) ** 2).sum(axis=0)
         application_call.add_auxiliary_variable(
             baseline_errors, name='baseline_errors')
+
         # The gradient of this will be the REINFORCE 1-sample
         # gradient estimate
         costs = (disconnected_grad(centered_future_rewards)
                  * (-log_probs)
                  * prediction_mask).sum(axis=0)
         return costs
-
-
-class WithBaseline(BaseRecurrent, Initializable):
-    def __init__(self, recurrent, state_to_use,
-                 baselines='baselines',
-                 initial_baselines='initial_baselines',
-                 **kwargs):
-        super(WithBaseline, self).__init__(**kwargs)
-
-        self.recurrent = recurrent
-        self.state_to_use = state_to_use
-        self.baselines = baselines
-        self.initial_baselines = initial_baselines
-
-        self.apply.sequences = recurrent.apply.sequences
-        self.apply.states = recurrent.apply.states + [self.baselines]
-        self.apply.contexts = (
-            recurrent.apply.contexts + [self.initial_baselines])
-        self.apply.outputs = recurrent.apply.outputs + [self.baselines]
-        self.initial_states.outputs = self.apply.outputs
-
-        self.baseline_predictor = Linear(output_dim=1, name='baseline_predictor')
-        self.children = [self.recurrent, self.baseline_predictor]
-
-    def _push_allocation_config(self):
-        self.baseline_predictor.input_dim = self.recurrent.get_dim(
-            self.state_to_use)
-
-    @recurrent
-    def apply(self, **kwargs):
-        # We have to have baselines as a state to work nicely with
-        # ReinforceReadout.
-        kwargs.pop('baselines')
-        initial_baselines = kwargs.pop(self.initial_baselines)
-        states = disconnected_grad(kwargs[self.state_to_use])
-        baselines = initial_baselines + self.baseline_predictor.apply(states)
-        outputs = (self.recurrent.apply(iterate=False, as_list=True, **kwargs)
-                   + [baselines])
-        return outputs
-
-    def get_dim(self, name):
-        if name == self.baselines:
-            return 1
-        if name == self.initial_baselines:
-            return 1
-        return self.recurrent.get_dim(name)
-
-    @application
-    def initial_states(self, batch_size, *args, **kwargs):
-        return (self.recurrent.initial_states(batch_size, *args, **kwargs)
-                + [kwargs[self.initial_baselines]])
 
 
 class WordReverser(Initializable):
@@ -217,44 +195,43 @@ class WordReverser(Initializable):
     def __init__(self, dimension, alphabet_size, entropy, **kwargs):
         super(WordReverser, self).__init__(**kwargs)
         encoder = Bidirectional(
-            GatedRecurrent(dim=dimension, activation=Tanh()))
+            SimpleRecurrent(dim=dimension, activation=Tanh()))
         fork = Fork([name for name in encoder.prototype.apply.sequences
                     if name != 'mask'])
         fork.input_dim = dimension
         fork.output_dims = [encoder.prototype.get_dim(name) for name in fork.input_names]
         lookup = LookupTable(alphabet_size, dimension)
 
-        recurrent = GatedRecurrent(
+        recurrent = SimpleRecurrent(
             activation=Tanh(),
             dim=dimension, name="recurrent")
         attention = SequenceContentAttention(
             state_names=recurrent.apply.states,
             attended_dim=2 * dimension, match_dim=dimension, name="attention")
         recurrent_att = AttentionRecurrent(recurrent, attention)
-        recurrent_att_baselined = WithBaseline(
-            recurrent_att, state_to_use=recurrent.apply.states[0])
         readout = ReinforceReadout(
             EditDistanceReward(),
             entropy=entropy,
-            dim=alphabet_size,
-            merged_states=[recurrent.apply.states[0],
-                           attention.take_glimpses.outputs[0]],
+            num_tokens=alphabet_size,
+            merge_names=[recurrent.apply.states[0],
+                         attention.take_glimpses.outputs[0]],
+            input_names=[recurrent.apply.states[0],
+                         attention.take_glimpses.outputs[0],
+                         'attended', 'attended_mask'],
             baselines='baselines',
             name="readout")
         feedback = Feedback([name for name in recurrent.apply.sequences
                              if name != 'mask'],
                             embedding=LookupTable(alphabet_size, dimension))
         generator = SequenceGenerator(
-            recurrent_att_baselined, readout, feedback,
+            recurrent_att, readout, feedback,
             name="generator")
-        baseline_readout = Linear(2 * dimension, 1, name='baseline_readout')
 
         self.fork = fork
         self.lookup = lookup
         self.encoder = encoder
         self.generator = generator
-        self.baseline_readout = baseline_readout
-        self.children = [fork, lookup, encoder, generator, baseline_readout]
+        self.children = [fork, lookup, encoder, generator]
 
     def mask_for_prediction(self, prediction):
         prediction_mask = tensor.lt(
@@ -272,24 +249,18 @@ class WordReverser(Initializable):
             **dict_union(
                 self.fork.apply(self.lookup.apply(chars), as_dict=True),
                 mask=chars_mask))
-        initial_baselines = (
-            self.baseline_readout.apply(
-                disconnected_grad(attended)) *
-                disconnected_grad(chars_mask)[:, :, None]).sum(axis=0)
         prediction = theano.gradient.disconnected_grad(
             self.generator.generate(
                 n_steps=5,#2 * chars.shape[0],
                 batch_size=chars.shape[1],
                 attended=attended,
-                attended_mask=chars_mask,
-                initial_baselines=initial_baselines)[0])
+                attended_mask=chars_mask)[0])
         prediction_mask = self.mask_for_prediction(prediction)
         return self.generator.costs(
             prediction=prediction, prediction_mask=prediction_mask,
             groundtruth=targets, groundtruth_mask=targets_mask,
             attended=attended,
-            attended_mask=chars_mask,
-            initial_baselines=initial_baselines)
+            attended_mask=chars_mask)
 
     @application
     def generate(self, chars):
@@ -299,7 +270,6 @@ class WordReverser(Initializable):
         return self.generator.generate(
             n_steps=3 * chars.shape[0],
             batch_size=chars.shape[1],
-            initial_baselines=self.baseline_readout.apply(attended).sum(axis=0),
             attended=attended,
             attended_mask=tensor.ones(chars.shape))
 
@@ -371,7 +341,7 @@ def main(mode, save_path, num_batches,
         reverser.push_initialization_config()
         reverser.encoder.weights_init = Orthogonal()
         # It is very ugly, but so far we do not have recurrent_weights_init
-        reverser.generator.recurrent.recurrent.transition.weights_init = Orthogonal()
+        reverser.generator.recurrent.transition.weights_init = Orthogonal()
         reverser.initialize()
 
         # Build the cost computation graph
@@ -415,9 +385,11 @@ def main(mode, save_path, num_batches,
         mean_baseline_error = baseline_errors.mean().copy('mean_baseline_error')
         assert cg.updates
         baseline_parameters = list(Selector([
-            reverser.baseline_readout, generator.recurrent.baseline_predictor])
+            generator.readout.value_summand,
+            generator.readout.value_adjustment])
             .get_parameters().values())
-        normal_parameters = [p for p in cg.parameters if p not in baseline_parameters]
+        normal_parameters = [p for p in cg.parameters
+                             if p not in baseline_parameters]
         algorithm = GradientDescent(
             cost=cost + mean_baseline_error,
             parameters=cg.parameters,
@@ -437,7 +409,7 @@ def main(mode, save_path, num_batches,
 
         # Fetch variables useful for debugging
         energies, = VariableFilter(
-            applications=[generator.readout._merge],
+            applications=[generator.readout.merge],
             name_regex="output")(cg.variables)
         activations, = VariableFilter(
             applications=[generator.recurrent.apply],
@@ -445,12 +417,11 @@ def main(mode, save_path, num_batches,
         rewards, = VariableFilter(
             bricks=[EditDistanceReward],
             roles=[blocks.roles.OUTPUT])(cg.variables)
-        rewards = rewards.sum(axis=0).sum(axis=-1).copy(name='rewards')
+        rewards = rewards.sum(axis=0)[:, 0].copy(name='rewards')
         initial_baselines, = VariableFilter(
-            applications=[generator.costs], name='initial_baselines')(cg)
-        initial_baselines = initial_baselines.sum(axis=-1).copy(name='initial_baselines')
+            bricks=[ReinforceReadout], name='initial_baselines')(cg)
         baselines, = VariableFilter(
-            applications=[generator.costs], name='baselines')(cg)
+            bricks=[ReinforceReadout], name='baselines')(cg)
         sumlogs, = VariableFilter(
             bricks=[ReinforceReadout], name='sumlogs')(cg)
         prediction, = VariableFilter(
@@ -470,8 +441,8 @@ def main(mode, save_path, num_batches,
             rewards.mean().copy('mean_reward'),
             sumlogs.mean().copy('entropy'),
             mean_baseline_error,
-            reverser.baseline_readout.b.copy(name='baseline_bias'),
-            algorithm.gradients[reverser.baseline_readout.b].copy(
+            generator.readout.value_summand.b.copy(name='baseline_bias'),
+            algorithm.gradients[generator.readout.value_summand.b].copy(
                 name='baseline_bias_grad'),
             #min_energy, max_energy, mean_activation,
             batch_size, max_length, cost_per_character,
