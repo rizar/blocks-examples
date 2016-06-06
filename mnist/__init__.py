@@ -29,7 +29,7 @@ except:
     BLOCKS_EXTRAS_AVAILABLE = False
 
 
-def main(save_to, scale, momentum, num_epochs):
+def main(save_to, criterion, scale, momentum, num_epochs):
     save_to = "{}_{}_{}".format(
         save_to, str(scale).replace('.', ''), str(momentum).replace('.', ''))
     save_main_loop_to = save_to + '.tar'
@@ -42,7 +42,10 @@ def main(save_to, scale, momentum, num_epochs):
     x = tensor.matrix('features')
     y = tensor.lmatrix('targets')
     probs = mlp.apply(x)
-    cost = CategoricalCrossEntropy().apply(y.flatten(), probs)
+    if criterion == 'nll':
+        cost = CategoricalCrossEntropy().apply(y.flatten(), probs)
+    elif criterion == 'pg':
+        cost = -probs[tensor.arange(x.shape[0]), y.flatten()].mean()
     error_rate = MisclassificationRate().apply(y.flatten(), probs)
     cg = ComputationGraph(cost)
     cost.name = 'final_cost'
