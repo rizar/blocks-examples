@@ -30,6 +30,11 @@ except:
 
 
 def main(save_to, scale, momentum, num_epochs):
+    save_to = "{}_{}_{}".format(
+        save_to, str(scale).replace('.', ''), str(momentum).replace('.', ''))
+    save_main_loop_to = save_to + '.tar'
+    save_result_to = save_to + '.csv'
+
     mlp = MLP([Rectifier(), Rectifier(), Softmax()], [784, 1000, 1000, 10],
               weights_init=IsotropicGaussian(0.01),
               biases_init=Constant(0))
@@ -64,7 +69,7 @@ def main(save_to, scale, momentum, num_epochs):
                        aggregation.mean(algorithm.total_gradient_norm)],
                       prefix="train",
                       after_epoch=True),
-                  Checkpoint(save_to),
+                  Checkpoint(save_main_loop_to),
                   Printing()]
 
     if BLOCKS_EXTRAS_AVAILABLE:
@@ -87,3 +92,9 @@ def main(save_to, scale, momentum, num_epochs):
         extensions=extensions)
 
     main_loop.run()
+
+    iterations_done = main_loop.status['iterations_done']
+    train_error = main_loop.log[iterations_done]['train_misclassificationrate_apply_error_rate']
+    test_error = main_loop.log[iterations_done]['test_misclassificationrate_apply_error_rate']
+    with open(save_result_to, 'w') as dst:
+        print >>dst, "{}, {}, {}, {}".format(scale, momentum, train_error, test_error)
