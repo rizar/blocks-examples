@@ -92,15 +92,3 @@ def main(save_to, num_epochs):
         extensions=extensions)
 
     main_loop.run()
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    parser = ArgumentParser("An example of training an MLP on"
-                            " the MNIST dataset.")
-    parser.add_argument("--num-epochs", type=int, default=2,
-                        help="Number of training epochs to do.")
-    parser.add_argument("save_to", default="mnist.pkl", nargs="?",
-                        help=("Destination to save the state of the training "
-                              "process."))
-    args = parser.parse_args()
-    main(args.save_to, args.num_epochs)
